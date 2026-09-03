@@ -1,5 +1,5 @@
 # SDC435L
-# Jerbra1624
+# Jerbra1624 # Dalwol9523 # Davnel2166
 
 # SDC435L: 1.6 Project
 GitHub Archive Redis CRUD Application
