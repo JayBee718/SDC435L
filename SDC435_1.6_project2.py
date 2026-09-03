@@ -1,5 +1,5 @@
 """
-Name: Jerald Bradley
+Name: Jerald Bradley, David Nelson, and Dalvin Wolff
 Date: September 3, 2026
 Assignment: GitHub Archive Redis CRUD Application
 Purpose: Import newline-delimited GitHub Archive JSON, manage repository
