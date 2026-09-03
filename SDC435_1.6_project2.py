@@ -3,7 +3,7 @@ Name: Jerald Bradley
 Date: September 3, 2026
 Assignment: GitHub Archive Redis CRUD Application
 Purpose: Import newline-delimited GitHub Archive JSON, manage repository
-records with Redis CRUD operations, and provide three data-analysis features.
+records with Redis CRUD operations, and provide four data-analysis features.
 """
 
 import json
