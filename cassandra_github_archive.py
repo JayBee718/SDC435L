@@ -1,5 +1,5 @@
 """
-Name: Jerald Bradley
+Name: Jerald Bradley/David Nelson 
 Date: September 16, 2026
 Assignment: Cassandra Intergration
 Purpose: Python terminal application imports repository records from the supplied
