@@ -1,468 +1,402 @@
-"""Menu-driven GitHub Archive application using Python and Neo4j.
-
-The application imports newline-delimited JSON and creates this graph:
-
-    (:Developer)-[:AUTHORED]->(:Commit)-[:BELONGS_TO]->(:Repository)
-    (:Developer)-[:COMMITTED]->(:Commit)
-    (:Developer)-[:CONTRIBUTED_TO]->(:Repository)
-
-Student ID: jerbra1624
+"""
+Name: Jerald Bradley
+Date: September 23, 2026
+Assignment: Python CRUD Application Using Neo4j
+Purpose: Import Amazon review data and provide a simple menu for creating,
+         reading, and deleting Neo4j nodes and relationships.
 """
 
 import json
-from getpass import getpass
 from pathlib import Path
 
+import tkinter as tk
+from tkinter import simpledialog
+
 from neo4j import GraphDatabase
-from neo4j.exceptions import Neo4jError
+from neo4j.exceptions import AuthError, Neo4jError, ServiceUnavailable
 
 
-DEFAULT_URI = "bolt://localhost:7687"
-DEFAULT_DATABASE = "neo4j"
-DEFAULT_COMMITS_FILE = "GitHubArchive-Dataset/Sample_Commits.json"
-DEFAULT_REPOS_FILE = "GitHubArchive-Dataset/Sample_Repos.json"
-BATCH_SIZE = 250
+
+# Neo4j connection settings for a local database.
+NEO4J_URI = "bolt://localhost:7687"
+NEO4J_USERNAME = "neo4j"
+NEO4J_DATABASE = "neo4j"
 
 
-def prompt_nonempty(prompt):
-    """Keep prompting until the user supplies text."""
+def required_input(message):
+    """Prompt until the user enters a value."""
     while True:
-        value = input(prompt).strip()
+        value = input(message).strip()
         if value:
             return value
         print("A value is required.")
 
 
-def prompt_integer(prompt, minimum=0):
-    """Return a validated whole number."""
-    while True:
+def load_json_file(file_name):
+    """Read the supplied JSON Lines file and return its records."""
+    path = Path(file_name.strip().strip('"'))
+    records = []
+
+    with path.open("r", encoding="utf-8") as json_file:
+        for line in json_file:
+            if line.strip():
+                records.append(json.loads(line))
+
+    return records
+
+
+def create_constraints(driver):
+    """Create uniqueness constraints to prevent duplicate nodes."""
+    queries = [
+        "create constraint category_name if not exists "
+        "for (n:Category) require n.name is unique",
+        "create constraint product_name if not exists "
+        "for (n:Product) require n.name is unique",
+        "create constraint review_id if not exists "
+        "for (n:Review) require n.review_id is unique",
+        "create constraint reviewer_name if not exists "
+        "for (n:Reviewer) require n.name is unique",
+    ]
+
+    with driver.session(database=NEO4J_DATABASE) as session:
+        for query in queries:
+            session.run(query).consume()
+
+
+def run_batch_query(driver, query, records):
+    """Run one Cypher query against the complete list of records."""
+    with driver.session(database=NEO4J_DATABASE) as session:
+        session.run(query, records=records).consume()
+
+
+def import_data(driver, records):
+    """Create the required nodes and relationships from the JSON records."""
+    print("Creating Category nodes...")
+    run_batch_query(
+        driver,
+        """
+        unwind $records as row
+        merge (:Category {name: row.product_category})
+        """,
+        records,
+    )
+
+    print("Creating Product nodes...")
+    run_batch_query(
+        driver,
+        """
+        unwind $records as row
+        merge (:Product {name: row.product_id})
+        """,
+        records,
+    )
+
+    print("Creating Review nodes...")
+    run_batch_query(
+        driver,
+        """
+        unwind $records as row
+        merge (review:Review {review_id: row.review_id})
+        set review.title = row.review_title,
+            review.content = row.review_body,
+            review.stars = toInteger(row.stars)
+        """,
+        records,
+    )
+
+    print("Creating Reviewer nodes...")
+    run_batch_query(
+        driver,
+        """
+        unwind $records as row
+        merge (:Reviewer {name: row.reviewer_id})
+        """,
+        records,
+    )
+
+    print("Connecting Products to Categories...")
+    run_batch_query(
+        driver,
+        """
+        unwind $records as row
+        match (product:Product {name: row.product_id})
+        match (category:Category {name: row.product_category})
+        merge (product)-[:IN_CATEGORY]->(category)
+        """,
+        records,
+    )
+
+    print("Connecting Reviews to Reviewers...")
+    run_batch_query(
+        driver,
+        """
+        unwind $records as row
+        match (review:Review {review_id: row.review_id})
+        match (reviewer:Reviewer {name: row.reviewer_id})
+        merge (reviewer)-[:WROTE]->(review)
+        """,
+        records,
+    )
+
+    print("Connecting Reviews to Products...")
+    run_batch_query(
+        driver,
+        """
+        unwind $records as row
+        match (review:Review {review_id: row.review_id})
+        match (product:Product {name: row.product_id})
+        merge (product)-[:HAS_REVIEW]->(review)
+        """,
+        records,
+    )
+
+
+# Menu option 1: Create a Category, Product, Review, or Reviewer node.
+def create_node(driver):
+    print("\n1. Category")
+    print("2. Product")
+    print("3. Review")
+    print("4. Reviewer")
+    choice = input("Select a node label: ").strip()
+
+    if choice == "1":
+        name = required_input("Category name: ")
+        query = "merge (:Category {name: $name})"
+        values = {"name": name}
+    elif choice == "2":
+        name = required_input("Product name: ")
+        query = "merge (:Product {name: $name})"
+        values = {"name": name}
+    elif choice == "3":
+        review_id = required_input("Review ID: ")
+        title = required_input("Review title: ")
+        content = required_input("Review content: ")
+
         try:
-            value = int(input(prompt).strip())
-            if value >= minimum:
-                return value
+            stars = int(input("Stars (1-5): "))
+            if stars < 1 or stars > 5:
+                raise ValueError
         except ValueError:
-            pass
-        print(f"Enter a whole number greater than or equal to {minimum}.")
+            print("Stars must be a whole number from 1 through 5.")
+            return
 
-
-def connect_to_neo4j():
-    """Collect connection settings and verify the Neo4j connection."""
-    uri = input(f"Neo4j URI [{DEFAULT_URI}]: ").strip() or DEFAULT_URI
-    username = input("Neo4j username [neo4j]: ").strip() or "neo4j"
-    # getpass prevents the database password from appearing on the screen.
-    password = getpass("Neo4j password: ")
-    database = input(f"Database [{DEFAULT_DATABASE}]: ").strip() or DEFAULT_DATABASE
-
-    driver = GraphDatabase.driver(uri, auth=(username, password))
-    driver.verify_connectivity()
-    return driver, database
-
-
-def create_schema(driver, database):
-    """Create unique constraints so MERGE and record lookup stay reliable."""
-    statements = (
-        "create constraint commit_hash_unique if not exists "
-        "for (c:Commit) require c.hash is unique",
-        "create constraint repository_name_unique if not exists "
-        "for (r:Repository) require r.name is unique",
-        "create constraint developer_email_unique if not exists "
-        "for (d:Developer) require d.email is unique",
-    )
-    with driver.session(database=database) as session:
-        for statement in statements:
-            session.run(statement).consume()
-
-
-def import_repository_batch(tx, rows):
-    """Write a batch of repository records in one Neo4j transaction."""
-    tx.run(
+        query = """
+        merge (review:Review {review_id: $review_id})
+        set review.title = $title,
+            review.content = $content,
+            review.stars = $stars
         """
-        unwind $rows as row
-        merge (r:Repository {name: row.name})
-        set r.watch_count = row.watch_count
-        """,
-        rows=rows,
-    ).consume()
-
-
-def import_commit_batch(tx, rows):
-    """Create commit, developer, repository nodes and their relationships."""
-    tx.run(
-        """
-        unwind $rows as row
-        merge (r:Repository {name: row.repo_name})
-        merge (c:Commit {hash: row.hash})
-        set c.subject = row.subject,
-            c.message = row.message,
-            c.tree = row.tree
-        merge (c)-[:BELONGS_TO]->(r)
-
-        merge (a:Developer {email: row.author_email})
-        set a.name = row.author_name
-        merge (a)-[:AUTHORED]->(c)
-        merge (a)-[:CONTRIBUTED_TO]->(r)
-
-        merge (m:Developer {email: row.committer_email})
-        set m.name = row.committer_name
-        merge (m)-[:COMMITTED]->(c)
-        merge (m)-[:CONTRIBUTED_TO]->(r)
-        """,
-        rows=rows,
-    ).consume()
-
-
-def import_repositories(driver, database, path, limit):
-    """Read repository JSONL and add watch counts to Repository nodes."""
-    imported = skipped = 0
-    batch = []
-    with path.open("r", encoding="utf-8") as source:
-        with driver.session(database=database) as session:
-            for line_number, line in enumerate(source, start=1):
-                if limit and imported >= limit:
-                    break
-                try:
-                    record = json.loads(line)
-                    row = {
-                        "name": str(record["repo_name"]).strip(),
-                        "watch_count": int(record.get("watch_count", 0)),
-                    }
-                    if not row["name"]:
-                        raise ValueError("blank repository name")
-                    batch.append(row)
-                    imported += 1
-                    if len(batch) == BATCH_SIZE:
-                        session.execute_write(import_repository_batch, batch)
-                        batch = []
-                except (json.JSONDecodeError, KeyError, TypeError, ValueError):
-                    skipped += 1
-                    print(f"Skipped invalid repository record on line {line_number}.")
-            if batch:
-                session.execute_write(import_repository_batch, batch)
-    return imported, skipped
-
-
-def import_commits(driver, database, path, limit):
-    """Read commit JSONL and transform each object into connected graph data."""
-    imported = skipped = 0
-    batch = []
-    with path.open("r", encoding="utf-8") as source:
-        with driver.session(database=database) as session:
-            for line_number, line in enumerate(source, start=1):
-                if limit and imported >= limit:
-                    break
-                try:
-                    record = json.loads(line)
-                    author = record.get("author") or {}
-                    committer = record.get("committer") or author
-                    row = {
-                        "hash": str(record["commit"]).strip(),
-                        "repo_name": str(record["repo_name"]).strip(),
-                        "subject": str(record.get("subject", "")).strip(),
-                        "message": str(record.get("message", "")).strip(),
-                        "tree": str(record.get("tree", "")).strip(),
-                        "author_name": str(author.get("name", "Unknown")).strip(),
-                        "author_email": str(author.get("email", "")).strip().lower(),
-                        "committer_name": str(committer.get("name", "Unknown")).strip(),
-                        "committer_email": str(committer.get("email", "")).strip().lower(),
-                    }
-                    required = (
-                        row["hash"], row["repo_name"], row["author_email"],
-                        row["committer_email"],
-                    )
-                    if not all(required):
-                        raise ValueError("missing graph identifier")
-                    batch.append(row)
-                    imported += 1
-                    if len(batch) == BATCH_SIZE:
-                        session.execute_write(import_commit_batch, batch)
-                        batch = []
-                except (json.JSONDecodeError, KeyError, TypeError, ValueError):
-                    skipped += 1
-                    print(f"Skipped invalid commit record on line {line_number}.")
-            if batch:
-                session.execute_write(import_commit_batch, batch)
-    return imported, skipped
-
-
-def import_json_data(driver, database):
-    """Menu action that imports repository metadata followed by commit data."""
-    repos_input = input(f"Repository JSON path [{DEFAULT_REPOS_FILE}]: ").strip()
-    commits_input = input(f"Commit JSON path [{DEFAULT_COMMITS_FILE}]: ").strip()
-    repos_path = Path(repos_input or DEFAULT_REPOS_FILE).expanduser()
-    commits_path = Path(commits_input or DEFAULT_COMMITS_FILE).expanduser()
-
-    if not repos_path.is_file() or not commits_path.is_file():
-        print("One or both files were not found. Extract the supplied ZIP first.")
+        values = {
+            "review_id": review_id,
+            "title": title,
+            "content": content,
+            "stars": stars,
+        }
+    elif choice == "4":
+        name = required_input("Reviewer name/reviewer_id: ")
+        query = "merge (:Reviewer {name: $name})"
+        values = {"name": name}
+    else:
+        print("Invalid selection.")
         return
 
-    limit = prompt_integer("Maximum commits to import (0 = all): ")
-    # Import enough repository rows to enrich any repository created by commits.
-    repo_limit = 0 if limit == 0 else max(limit, 1000)
-    repos_saved, repos_skipped = import_repositories(
-        driver, database, repos_path, repo_limit
-    )
-    commits_saved, commits_skipped = import_commits(
-        driver, database, commits_path, limit
-    )
-    print(
-        f"Import complete: {repos_saved} repositories and {commits_saved} commits "
-        f"saved; {repos_skipped + commits_skipped} invalid records skipped."
-    )
+    with driver.session(database=NEO4J_DATABASE) as session:
+        session.run(query, **values).consume()
+    print("Node created successfully.")
 
 
-def create_commit(driver, database):
-    """Create one commit and connect it to a developer and repository."""
-    data = {
-        "hash": prompt_nonempty("Commit hash or unique demo ID: "),
-        "repo_name": prompt_nonempty("Repository (owner/name): "),
-        "subject": prompt_nonempty("Commit subject: "),
-        "message": input("Commit message: ").strip(),
-        "author_name": prompt_nonempty("Author name: "),
-        "author_email": prompt_nonempty("Author email: ").lower(),
-    }
-    query = """
-    merge (r:Repository {name: $repo_name})
-    merge (d:Developer {email: $author_email})
-    set d.name = $author_name
-    merge (c:Commit {hash: $hash})
-    set c.subject = $subject, c.message = $message
-    merge (d)-[:AUTHORED]->(c)
-    merge (d)-[:COMMITTED]->(c)
-    merge (c)-[:BELONGS_TO]->(r)
-    merge (d)-[:CONTRIBUTED_TO]->(r)
-    return c.hash as hash
-    """
-    with driver.session(database=database) as session:
-        session.run(query, **data).consume()
-    print("Commit and graph relationships saved.")
+# Menu option 2: Create Product-Category or Product-Review relationships.
+def create_relationship(driver):
+    print("\n1. Product to Category")
+    print("2. Product to Review")
+    choice = input("Select a relationship: ").strip()
+    product_name = required_input("Product name: ")
 
-
-def read_commit(driver, database):
-    """Retrieve a commit with its repository, author, and committer."""
-    commit_hash = prompt_nonempty("Exact commit hash or demo ID: ")
-    query = """
-    match (c:Commit {hash: $hash})-[:BELONGS_TO]->(r:Repository)
-    optional match (a:Developer)-[:AUTHORED]->(c)
-    optional match (m:Developer)-[:COMMITTED]->(c)
-    return c.hash as hash, c.subject as subject, c.message as message,
-           r.name as repository, a.name as author, a.email as author_email,
-           m.name as committer
-    """
-    with driver.session(database=database) as session:
-        record = session.run(query, hash=commit_hash).single()
-    if not record:
-        print("Commit not found.")
+    if choice == "1":
+        category_name = required_input("Category name: ")
+        query = """
+        match (product:Product {name: $product_name})
+        match (category:Category {name: $target})
+        merge (product)-[:IN_CATEGORY]->(category)
+        return product
+        """
+        target = category_name
+    elif choice == "2":
+        review_id = required_input("Review ID: ")
+        query = """
+        match (product:Product {name: $product_name})
+        match (review:Review {review_id: $target})
+        merge (product)-[:HAS_REVIEW]->(review)
+        return product
+        """
+        target = review_id
+    else:
+        print("Invalid selection.")
         return
-    print(f"\nHash: {record['hash']}")
-    print(f"Repository: {record['repository']}")
-    print(f"Author: {record['author']} <{record['author_email']}>")
-    print(f"Committer: {record['committer'] or 'Not recorded'}")
-    print(f"Subject: {record['subject']}")
-    print(f"Message: {record['message']}")
+
+    with driver.session(database=NEO4J_DATABASE) as session:
+        result = session.run(
+            query, product_name=product_name, target=target
+        ).single()
+
+    if result:
+        print("Relationship created successfully.")
+    else:
+        print("Relationship not created. Check that both nodes exist.")
 
 
-def update_commit(driver, database):
-    """Update the subject and message of an existing commit."""
-    commit_hash = prompt_nonempty("Exact commit hash or demo ID to update: ")
-    subject = prompt_nonempty("New subject: ")
-    message = input("New message: ").strip()
+# Menu option 3: Count Products related to a Category.
+def count_products(driver):
+    category_name = required_input("Category name: ")
     query = """
-    match (c:Commit {hash: $hash})
-    set c.subject = $subject, c.message = $message
-    return count(c) as changed
+    match (product:Product)-[:IN_CATEGORY]->
+          (category:Category {name: $category_name})
+    return count(product) as total
     """
-    with driver.session(database=database) as session:
-        changed = session.run(
-            query, hash=commit_hash, subject=subject, message=message
-        ).single()["changed"]
-    print("Commit updated." if changed else "Commit not found; nothing was updated.")
+
+    with driver.session(database=NEO4J_DATABASE) as session:
+        total = session.run(
+            query, category_name=category_name
+        ).single()["total"]
+    print(f"Products in {category_name}: {total}")
 
 
-def delete_commit(driver, database):
-    """Delete one commit while leaving shared developer and repository nodes."""
-    commit_hash = prompt_nonempty("Exact commit hash or demo ID to delete: ")
-    if input("Type DELETE to confirm: ").strip() != "DELETE":
+# Menu option 4: Count Reviews related to a Reviewer.
+def count_reviews(driver):
+    reviewer_name = required_input("Reviewer name/reviewer_id: ")
+    query = """
+    match (reviewer:Reviewer {name: $reviewer_name})-[:WROTE]->
+          (review:Review)
+    return count(review) as total
+    """
+
+    with driver.session(database=NEO4J_DATABASE) as session:
+        total = session.run(
+            query, reviewer_name=reviewer_name
+        ).single()["total"]
+    print(f"Reviews by {reviewer_name}: {total}")
+
+
+# Menu option 5: Delete one Category and its relationships.
+def delete_category(driver):
+    category_name = required_input("Category name to delete: ")
+    query = """
+    match (category:Category {name: $category_name})
+    detach delete category
+    """
+
+    with driver.session(database=NEO4J_DATABASE) as session:
+        result = session.run(query, category_name=category_name).consume()
+    print(f"Deleted {result.counters.nodes_deleted} Category node(s).")
+
+
+# Menu option 6: Delete every relationship but keep the nodes.
+def delete_all_relationships(driver):
+    confirm = input("Type YES to delete all relationships: ").strip()
+    if confirm != "YES":
         print("Delete canceled.")
         return
-    query = """
-    match (c:Commit {hash: $hash})
-    with c, count(c) as found
-    detach delete c
-    return found
-    """
-    with driver.session(database=database) as session:
-        record = session.run(query, hash=commit_hash).single()
-    print("Commit deleted." if record else "Commit not found.")
+
+    with driver.session(database=NEO4J_DATABASE) as session:
+        result = session.run("match ()-[relationship]->() delete relationship").consume()
+    print(f"Deleted {result.counters.relationships_deleted} relationship(s).")
 
 
-def contributor_leaderboard(driver, database):
-    """Feature 1: rank authors by commits and repository reach."""
-    limit = prompt_integer("Number of contributors to display: ", 1)
-    query = """
-    match (d:Developer)-[:AUTHORED]->(c:Commit)-[:BELONGS_TO]->(r:Repository)
-    return d.name as developer, d.email as email, count(c) as commits,
-           count(distinct r) as repositories
-    order by commits desc, repositories desc, developer
-    limit $limit
-    """
-    with driver.session(database=database) as session:
-        rows = list(session.run(query, limit=limit))
-    print("\nContributor leaderboard")
-    for number, row in enumerate(rows, start=1):
-        print(
-            f"{number:>2}. {row['developer']} - {row['commits']} commits across "
-            f"{row['repositories']} repositories"
-        )
-
-
-def repository_constellation(driver, database):
-    """Feature 2: show a repository's graph neighborhood."""
-    name = prompt_nonempty("Exact repository name: ")
-    query = """
-    match (r:Repository {name: $name})
-    optional match (d:Developer)-[:AUTHORED]->(c:Commit)-[:BELONGS_TO]->(r)
-    with r, count(distinct c) as commits, count(distinct d) as contributors,
-         collect(distinct d.name)[0..8] as people,
-         collect(distinct c.subject)[0..5] as subjects
-    return r.name as repository, r.watch_count as watches, commits,
-           contributors, people, subjects
-    """
-    with driver.session(database=database) as session:
-        row = session.run(query, name=name).single()
-    if not row:
-        print("Repository not found.")
+# Menu option 7: Delete every node and remaining relationship.
+def delete_all_nodes(driver):
+    confirm = input("Type YES to delete all nodes: ").strip()
+    if confirm != "YES":
+        print("Delete canceled.")
         return
-    print(f"\nRepository constellation: {row['repository']}")
-    print(f"Watches: {row['watches'] if row['watches'] is not None else 'Unknown'}")
-    print(f"Imported commits: {row['commits']}")
-    print(f"Contributors: {row['contributors']}")
-    print("People: " + (", ".join(row["people"]) or "None in imported sample"))
-    print("Recent subjects:")
-    for subject in row["subjects"]:
-        print(f"  - {subject}")
+
+    with driver.session(database=NEO4J_DATABASE) as session:
+        result = session.run("match (node) detach delete node").consume()
+    print(f"Deleted {result.counters.nodes_deleted} node(s).")
 
 
-def collaborator_recommendations(driver, database):
-    """Feature 3: recommend developers based on repositories in common."""
-    email = prompt_nonempty("Developer email: ").lower()
-    query = """
-    match (me:Developer {email: $email})-[:CONTRIBUTED_TO]->(r:Repository)
-          <-[:CONTRIBUTED_TO]-(other:Developer)
-    where other <> me
-    return other.name as developer, other.email as email,
-           count(distinct r) as shared_repositories,
-           collect(distinct r.name)[0..5] as examples
-    order by shared_repositories desc, developer
-    limit 10
-    """
-    with driver.session(database=database) as session:
-        rows = list(session.run(query, email=email))
-    if not rows:
-        print("No collaborator recommendations were found in the imported sample.")
-        return
-    print("\nSuggested collaborators")
-    for row in rows:
-        print(
-            f"- {row['developer']} ({row['email']}): "
-            f"{row['shared_repositories']} shared repos — {', '.join(row['examples'])}"
-        )
-
-
-def developer_connection_path(driver, database):
-    """Feature 4: find the shortest shared-repository path between developers."""
-    first = prompt_nonempty("First developer email: ").lower()
-    second = prompt_nonempty("Second developer email: ").lower()
-    query = """
-    match (a:Developer {email: $first}), (b:Developer {email: $second})
-    match path = shortestPath((a)-[:CONTRIBUTED_TO*..6]-(b))
-    return [node in nodes(path) |
-        case when node:Developer then coalesce(node.name, node.email)
-             else node.name end] as connection
-    """
-    with driver.session(database=database) as session:
-        row = session.run(query, first=first, second=second).single()
-    if not row:
-        print("No connection was found within three repository hops.")
-        return
-    print("Connection path: " + " -> ".join(row["connection"]))
-
-
-def search_commit_messages(driver, database):
-    """Feature 5: search subjects and messages for a case-insensitive keyword."""
-    keyword = prompt_nonempty("Commit keyword: ").lower()
-    query = """
-    match (c:Commit)-[:BELONGS_TO]->(r:Repository)
-    where toLower(coalesce(c.subject, '')) contains $keyword
-       or toLower(coalesce(c.message, '')) contains $keyword
-    return c.hash as hash, c.subject as subject, r.name as repository
-    order by repository, subject
-    limit 20
-    """
-    with driver.session(database=database) as session:
-        rows = list(session.run(query, keyword=keyword))
-    if not rows:
-        print("No matching commits were found.")
-        return
-    for row in rows:
-        print(f"- [{row['hash'][:10]}] {row['repository']}: {row['subject']}")
-
-
-def show_menu():
-    """Display all application actions."""
-    print(
-        "\nGitHub Archive Neo4j Explorer\n"
-        "1. Import GitHub Archive JSON\n"
-        "2. Create a commit\n"
-        "3. Read a commit\n"
-        "4. Update a commit\n"
-        "5. Delete a commit\n"
-        "6. Contributor leaderboard\n"
-        "7. Repository constellation\n"
-        "8. Collaborator recommendations\n"
-        "9. Developer connection path\n"
-        "10. Search commit messages\n"
-        "11. Exit"
-    )
+def display_menu():
+    """Display the simplified menu shown in the assignment example."""
+    print("\nType in a number and press Enter to execute the menu option.")
+    print("1. Create a new node")
+    print("2. Create a new relationship")
+    print("3. Count Products per Category")
+    print("4. Count Reviews per Reviewer")
+    print("5. Delete a category")
+    print("6. Delete all relationships")
+    print("7. Delete all nodes")
+    print("8. Exit the program")
 
 
 def main():
-    """Connect to Neo4j and run the terminal menu until the user exits."""
-    try:
-        driver, database = connect_to_neo4j()
-        create_schema(driver, database)
-    except Exception as error:
-        print(f"Could not connect to Neo4j: {error}")
-        print("Confirm Neo4j is running and that your URI, username, and password are correct.")
+    """Connect, import the file, and run the menu."""
+    root = tk.Tk()
+    root.withdraw()
+    password = simpledialog.askstring(
+        "Neo4j Login",
+        "Enter your Neo4j password:",
+        show="*"
+    )
+    # Close the hidden Tkinte window after receiving the password
+    root.destroy()
+
+    # Stop the program if the user cancels or leaves the password blank
+    if not password:
+        print("A password is required.")
         return
 
-    actions = {
-        "1": import_json_data,
-        "2": create_commit,
-        "3": read_commit,
-        "4": update_commit,
-        "5": delete_commit,
-        "6": contributor_leaderboard,
-        "7": repository_constellation,
-        "8": collaborator_recommendations,
-        "9": developer_connection_path,
-        "10": search_commit_messages,
-    }
+    # Ask the user for the location of the JSON dataset
+    file_name = required_input("Enter the path to the JSON file: ")
+
+    # Create the Neo4j driver using the database URI,
+    # username, and password entered by the user
+    driver = GraphDatabase.driver(
+        NEO4J_URI,
+        auth=(NEO4J_USERNAME, password),
+    )
 
     try:
+        print("\nConnecting to local Neo4j database...")
+        driver.verify_connectivity()
+        create_constraints(driver)
+
+        print("Importing data from file...")
+        records = load_json_file(file_name)
+        import_data(driver, records)
+
         while True:
-            show_menu()
-            choice = input("Choose an option: ").strip()
-            if choice == "11":
-                print("Goodbye!")
+            display_menu()
+            choice = input("Enter your choice: ").strip()
+
+            if choice == "1":
+                create_node(driver)
+            elif choice == "2":
+                create_relationship(driver)
+            elif choice == "3":
+                count_products(driver)
+            elif choice == "4":
+                count_reviews(driver)
+            elif choice == "5":
+                delete_category(driver)
+            elif choice == "6":
+                delete_all_relationships(driver)
+            elif choice == "7":
+                delete_all_nodes(driver)
+            elif choice == "8":
+                print("Program closed.")
                 break
-            action = actions.get(choice)
-            if not action:
-                print("Choose an option from 1 through 11.")
-                continue
-            try:
-                action(driver, database)
-            except (Neo4jError, OSError) as error:
-                print(f"The operation could not be completed: {error}")
+            else:
+                print("Please enter a number from 1 through 8.")
+
+    except FileNotFoundError:
+        print("The JSON file was not found. Check the path and try again.")
+    except json.JSONDecodeError as error:
+        print(f"Invalid JSON data near line {error.lineno}.")
+    except AuthError:
+        print("Authentication failed. Check your Neo4j password.")
+    except ServiceUnavailable:
+        print("Neo4j is unavailable. Make sure the database is running.")
+    except Neo4jError as error:
+        print(f"Neo4j error: {error}")
     finally:
         driver.close()
 
