@@ -1,7 +1,7 @@
 """GitHub Archive SQLite terminal application.
 
-Name: Jerald Bradley
-Student ID: jerbra1624
+Name(s): Jerald Bradley, David Nelson, Tracey Scott
+
 Week 5 Project: Python Application with SQLite Integration
 
 This program reads JSON Lines data directly from the supplied GitHub Archive
