@@ -19,3 +19,8 @@ records with Apache Cassandra CRUD operations, and provide various data-analysis
 # SDC435L: 4.3 project
 Purpose: Import newline-delimited GitHub Archive JSON, manage repository
 records with Neo4j CRUD operations, and provide various data-analysis features
+
+# SDC435L: 5.3 project
+
+Purpose: Import newline-delimited GitHub Archive JSON, manage repository
+records with SQLite CRUD operations, and provide various data-analysis features
